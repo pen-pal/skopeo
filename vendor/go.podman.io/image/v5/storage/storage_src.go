@@ -259,7 +259,10 @@ func (s *storageImageSource) GetManifest(ctx context.Context, instanceDigest *di
 					return nil, "", err
 				}
 				blob, err := s.imageRef.transport.store.ImageBigData(s.image.ID, key)
-				if err != nil && !os.IsNotExist(err) { // os.IsNotExist is true if the image exists but there is no data corresponding to key
+				// errors.Is(err, os.ErrNotExist) is true if the image exists but there is no data corresponding to key.
+				// (Previously this used os.IsNotExist, which does not unwrap fmt.Errorf("...%w", os.ErrNotExist)
+				// and so silently returned the wrapped error instead of treating it as a missing entry.)
+				if err != nil && !errors.Is(err, os.ErrNotExist) {
 					return nil, "", err
 				}
 				if err == nil {
