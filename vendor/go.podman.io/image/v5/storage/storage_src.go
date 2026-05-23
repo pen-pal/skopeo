@@ -44,6 +44,11 @@ type storageImageSource struct {
 	cachedManifestMIMEType string     // Valid if cachedManifest != nil
 	getBlobMutex           sync.Mutex // Mutex to sync state for parallel GetBlob executions
 	getBlobMutexProtected  getBlobMutexProtected
+
+	// EXPERIMENTAL (skopeo #2858): cache of per-instance image records discovered when
+	// s.image is a manifest-list record and per-platform data lives on other records.
+	perInstanceMu sync.Mutex
+	perInstance   map[digest.Digest]*storage.Image // instanceDigest -> per-platform image (or nil if known-missing)
 }
 
 // getBlobMutexProtected contains storageImageSource data protected by getBlobMutex.
@@ -145,6 +150,18 @@ func (s *storageImageSource) GetBlob(ctx context.Context, info types.BlobInfo, c
 	// If it's not a layer, then it must be a data item.
 	if len(layers) == 0 {
 		b, err := s.imageRef.transport.store.ImageBigData(s.image.ID, digest.String())
+		if err != nil && errors.Is(err, os.ErrNotExist) {
+			// EXPERIMENTAL (skopeo #2858): the resolved image record doesn't carry this
+			// non-layer blob (typically a config) as big-data, but a previously-discovered
+			// per-instance image record might. Try each one.
+			for _, altID := range s.cachedPerInstanceImageIDs() {
+				if alt, altErr := s.imageRef.transport.store.ImageBigData(altID, digest.String()); altErr == nil {
+					r := bytes.NewReader(alt)
+					logrus.Debugf("exporting opaque data as blob %q from per-instance image %q", digest.String(), altID)
+					return io.NopCloser(r), int64(r.Len()), nil
+				}
+			}
+		}
 		if err != nil {
 			return nil, 0, err
 		}
@@ -244,6 +261,16 @@ func (s *storageImageSource) GetManifest(ctx context.Context, instanceDigest *di
 			return nil, "", err
 		}
 		blob, err := s.imageRef.transport.store.ImageBigData(s.image.ID, key)
+		if err != nil && errors.Is(err, os.ErrNotExist) {
+			// EXPERIMENTAL (skopeo #2858): the resolved image record doesn't carry
+			// per-instance manifests as big-data. This happens when a manifest list is
+			// stored as its own image record (e.g. created by `buildah manifest create`
+			// / `manifest add`) and per-platform manifests live on separate image
+			// records. Try to find one.
+			if altBlob, altMIME, ok := s.tryReadInstanceManifestFromOtherImage(*instanceDigest, key); ok {
+				return altBlob, altMIME, nil
+			}
+		}
 		if err != nil {
 			return nil, "", fmt.Errorf("reading manifest for image instance %q: %w", *instanceDigest, err)
 		}
@@ -284,6 +311,108 @@ func (s *storageImageSource) GetManifest(ctx context.Context, instanceDigest *di
 	return s.cachedManifest, s.cachedManifestMIMEType, err
 }
 
+// findOrCachePerInstanceImage returns the image record (other than s.image) that holds
+// per-instance data for instanceDigest, caching the result. Returns nil if none can be
+// found (also cached, to avoid repeated store scans).
+//
+// EXPERIMENTAL (skopeo #2858): supports the layout produced by `buildah manifest`,
+// where the manifest list is one image record and the per-platform data lives on
+// separate per-platform image records.
+func (s *storageImageSource) findOrCachePerInstanceImage(instanceDigest digest.Digest) *storage.Image {
+	s.perInstanceMu.Lock()
+	defer s.perInstanceMu.Unlock()
+	if s.perInstance == nil {
+		s.perInstance = map[digest.Digest]*storage.Image{}
+	}
+	if cached, ok := s.perInstance[instanceDigest]; ok {
+		return cached
+	}
+	candidates, err := s.imageRef.transport.store.ImagesByDigest(instanceDigest)
+	if err != nil || len(candidates) == 0 {
+		s.perInstance[instanceDigest] = nil
+		return nil
+	}
+	// Prefer candidates that share a repo with our resolved reference; per-platform images
+	// may also be added to a manifest list by ID alone, with no shared name.
+	var preferred, others []*storage.Image
+	for _, cand := range candidates {
+		if cand.ID == s.image.ID {
+			continue
+		}
+		if s.imageRef.named != nil && imageMatchesRepo(cand, s.imageRef.named) {
+			preferred = append(preferred, cand)
+		} else {
+			others = append(others, cand)
+		}
+	}
+	var result *storage.Image
+	switch {
+	case len(preferred) > 0:
+		result = preferred[0]
+	case len(others) > 0:
+		result = others[0]
+	}
+	s.perInstance[instanceDigest] = result
+	return result
+}
+
+// tryReadInstanceManifestFromOtherImage reads the per-instance manifest from the
+// per-platform image record cached by findOrCachePerInstanceImage. Returns ok=false if
+// no usable record is found or the read fails.
+//
+// EXPERIMENTAL (skopeo #2858).
+func (s *storageImageSource) tryReadInstanceManifestFromOtherImage(instanceDigest digest.Digest, key string) ([]byte, string, bool) {
+	alt := s.findOrCachePerInstanceImage(instanceDigest)
+	if alt == nil {
+		return nil, "", false
+	}
+	if blob, err := s.imageRef.transport.store.ImageBigData(alt.ID, key); err == nil {
+		return blob, manifest.GuessMIMEType(blob), true
+	}
+	if blob, err := s.imageRef.transport.store.ImageBigData(alt.ID, storage.ImageDigestBigDataKey); err == nil {
+		if algo := instanceDigest.Algorithm(); algo.Available() && algo.FromBytes(blob) == instanceDigest {
+			return blob, manifest.GuessMIMEType(blob), true
+		}
+	}
+	return nil, "", false
+}
+
+// cachedPerInstanceImageIDs returns the IDs of all per-instance image records currently
+// cached. Used by GetBlob's non-layer fallback when the caller can't tell us which
+// instance owns a given blob.
+//
+// EXPERIMENTAL (skopeo #2858).
+func (s *storageImageSource) cachedPerInstanceImageIDs() []string {
+	s.perInstanceMu.Lock()
+	defer s.perInstanceMu.Unlock()
+	ids := make([]string, 0, len(s.perInstance))
+	for _, img := range s.perInstance {
+		if img != nil {
+			ids = append(ids, img.ID)
+		}
+	}
+	return ids
+}
+
+// parseStorageImageMetadata decodes a storage.Image's Metadata JSON into our
+// storageImageMetadata. Returns a zero-valued metadata on missing/empty input.
+//
+// EXPERIMENTAL (skopeo #2858): used by GetSignaturesWithFormat to consult the metadata
+// of a per-instance image record discovered via findOrCachePerInstanceImage.
+func parseStorageImageMetadata(img *storage.Image) (storageImageMetadata, error) {
+	m := storageImageMetadata{
+		SignatureSizes:  []int{},
+		SignaturesSizes: make(map[digest.Digest][]int),
+	}
+	if img == nil || img.Metadata == "" {
+		return m, nil
+	}
+	if err := json.Unmarshal([]byte(img.Metadata), &m); err != nil {
+		return m, fmt.Errorf("decoding metadata for image %q: %w", img.ID, err)
+	}
+	return m, nil
+}
+
 // LayerInfosForCopy() returns the list of layer blobs that make up the root filesystem of
 // the image, after they've been decompressed.
 func (s *storageImageSource) LayerInfosForCopy(ctx context.Context, instanceDigest *digest.Digest) ([]types.BlobInfo, error) {
@@ -311,11 +440,21 @@ func (s *storageImageSource) LayerInfosForCopy(ctx context.Context, instanceDige
 	}
 
 	physicalBlobInfos := []layerForCopy{} // Built reversed
-	layerID := s.image.TopLayer
+	// EXPERIMENTAL (skopeo #2858): if instanceDigest is provided and points at a per-platform
+	// image stored separately from s.image (e.g. buildah's manifest-list layout), walk that
+	// image's layer chain instead of s.image's (which would have no layers when s.image is
+	// a manifest-list record).
+	imageForLayers := s.image
+	if instanceDigest != nil {
+		if alt := s.findOrCachePerInstanceImage(*instanceDigest); alt != nil {
+			imageForLayers = alt
+		}
+	}
+	layerID := imageForLayers.TopLayer
 	for layerID != "" {
 		layer, err := s.imageRef.transport.store.Layer(layerID)
 		if err != nil {
-			return nil, fmt.Errorf("reading layer %q in image %q: %w", layerID, s.image.ID, err)
+			return nil, fmt.Errorf("reading layer %q in image %q: %w", layerID, imageForLayers.ID, err)
 		}
 
 		blobDigest := layer.UncompressedDigest
@@ -357,7 +496,7 @@ func (s *storageImageSource) LayerInfosForCopy(ctx context.Context, instanceDige
 
 	res, err := buildLayerInfosForCopy(man.LayerInfos(), physicalBlobInfos, gzipCompressedLayerType)
 	if err != nil {
-		return nil, fmt.Errorf("creating LayerInfosForCopy of image %q: %w", s.image.ID, err)
+		return nil, fmt.Errorf("creating LayerInfosForCopy of image %q: %w", imageForLayers.ID, err)
 	}
 	return res, nil
 }
@@ -425,8 +564,34 @@ func (s *storageImageSource) GetSignaturesWithFormat(ctx context.Context, instan
 	signatureSizes := s.metadata.SignatureSizes
 	key := "signatures"
 	instance := "default instance"
+	// EXPERIMENTAL (skopeo #2858): when reading signatures for a manifest-list child
+	// instance whose data lives on a separate per-platform image record (e.g. the
+	// layout produced by `buildah manifest`), source the signature sizes and the
+	// big-data blob from that per-platform record.
+	imageForSigs := s.image
 	if instanceDigest != nil {
 		signatureSizes = s.metadata.SignaturesSizes[*instanceDigest]
+		if alt := s.findOrCachePerInstanceImage(*instanceDigest); alt != nil {
+			altMeta, mErr := parseStorageImageMetadata(alt)
+			if mErr != nil {
+				return nil, mErr
+			}
+			// Per-instance images can carry their per-instance signature sizes either
+			// under SignaturesSizes[instanceDigest] (if they were themselves the parent
+			// of a nested manifest list) or under SignatureSizes (as a leaf image).
+			if sz := altMeta.SignaturesSizes[*instanceDigest]; len(sz) > 0 {
+				signatureSizes = sz
+				imageForSigs = alt
+			} else if len(altMeta.SignatureSizes) > 0 {
+				signatureSizes = altMeta.SignatureSizes
+				imageForSigs = alt
+			} else if len(signatureSizes) == 0 {
+				// Neither source has signatures; the per-platform image is still the
+				// authoritative record for this instance, so prefer it for any
+				// subsequent ImageBigData reads (which will harmlessly find nothing).
+				imageForSigs = alt
+			}
+		}
 		k, err := signatureBigDataKey(*instanceDigest)
 		if err != nil {
 			return nil, err
@@ -438,16 +603,16 @@ func (s *storageImageSource) GetSignaturesWithFormat(ctx context.Context, instan
 		instance = instanceDigest.Encoded()
 	}
 	if len(signatureSizes) > 0 {
-		data, err := s.imageRef.transport.store.ImageBigData(s.image.ID, key)
+		data, err := s.imageRef.transport.store.ImageBigData(imageForSigs.ID, key)
 		if err != nil {
-			return nil, fmt.Errorf("looking up signatures data for image %q (%s): %w", s.image.ID, instance, err)
+			return nil, fmt.Errorf("looking up signatures data for image %q (%s): %w", imageForSigs.ID, instance, err)
 		}
 		signatureBlobs = data
 	}
 	res := []signature.Signature{}
 	for _, length := range signatureSizes {
 		if offset+length > len(signatureBlobs) {
-			return nil, fmt.Errorf("looking up signatures data for image %q (%s): expected at least %d bytes, only found %d", s.image.ID, instance, len(signatureBlobs), offset+length)
+			return nil, fmt.Errorf("looking up signatures data for image %q (%s): expected at least %d bytes, only found %d", imageForSigs.ID, instance, len(signatureBlobs), offset+length)
 		}
 		sig, err := signature.FromBlob(signatureBlobs[offset : offset+length])
 		if err != nil {
